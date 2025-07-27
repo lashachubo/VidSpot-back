@@ -16,27 +16,24 @@ def detect_object(frame, target_class="person"):
             return True
     return False
 
-def binary_search(video_path, target_class="person"):
+def find_first_and_last(video_path, target_class):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    low, high = 0, total_frames - 1
-    first_occurrence = -1
+    
+    first_occurrence, last_occurrence = -1, -1
 
-    while low <= high:
-        mid = (low + high) // 2
-        cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
+    for frame_num in range(total_frames):
         ret, frame = cap.read()
         if not ret:
             break
-
         if detect_object(frame, target_class):
-            first_occurrence = mid
-            high = mid - 1
-        else:
-            low = mid + 1
+            if first_occurrence == -1:
+                first_occurrence = frame_num  # First time we see it
+            last_occurrence = frame_num  # Keep updating last time
 
     cap.release()
-    return first_occurrence
+    return first_occurrence, last_occurrence
+
 
 @app.post("/search")
 async def search(video: UploadFile = File(...), target_class: str = Form(...)):
@@ -44,9 +41,14 @@ async def search(video: UploadFile = File(...), target_class: str = Form(...)):
     with open(temp_path, "wb") as f:
         f.write(await video.read())
 
-    frame_number = binary_search(temp_path, target_class)
+    first_frame, last_frame = find_first_and_last(temp_path, target_class)
     os.remove(temp_path)
 
-    if frame_number == -1:
+    if first_frame == -1:
         return JSONResponse(content={"message": f"No '{target_class}' detected."}, status_code=200)
-    return JSONResponse(content={"frame_number": frame_number, "message": f"First '{target_class}' found at frame {frame_number}"}, status_code=200)
+    
+    return JSONResponse(content={
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "message": f"'{target_class}' appears from frame {first_frame} to {last_frame}"
+    }, status_code=200)
