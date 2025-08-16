@@ -16,23 +16,52 @@ def detect_object(frame, target_class="person"):
             return True
     return False
 
+def frame_has_object(cap, frame_num, target_class):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+    ret, frame = cap.read()
+    if not ret:
+        return False
+    return detect_object(frame, target_class)
+
+
+def binary_search_first(cap, total_frames, target_class):
+    left, right = 0, total_frames - 1
+    result = -1
+    while left <= right:
+        mid = (left + right) // 2
+        if frame_has_object(cap, mid, target_class):
+            result = mid
+            right = mid - 1
+        else:
+            left = mid + 1
+    return result
+
+
+def binary_search_last(cap, total_frames, target_class):
+    left, right = 0, total_frames - 1
+    result = -1
+    while left <= right:
+        mid = (left + right) // 2
+        if frame_has_object(cap, mid, target_class):
+            result = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+    return result
+
+
 def find_first_and_last(video_path, target_class):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    first_occurrence, last_occurrence = -1, -1
 
-    for frame_num in range(total_frames):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if detect_object(frame, target_class):
-            if first_occurrence == -1:
-                first_occurrence = frame_num  # First time we see it
-            last_occurrence = frame_num  # Keep updating last time
+    first_occurrence = binary_search_first(cap, total_frames, target_class)
+    last_occurrence = -1
+    if first_occurrence != -1:
+        last_occurrence = binary_search_last(cap, total_frames, target_class)
 
     cap.release()
     return first_occurrence, last_occurrence
+
 
 
 @app.post("/search")
