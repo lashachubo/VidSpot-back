@@ -1,186 +1,367 @@
+# uvicorn main:app --reload --host 0.0.0.0 --port 8000
 import os
 import shutil
-import tempfile
-from typing import Optional
+from typing import Optional, Dict, Any
 from pathlib import Path
-from contextlib import contextmanager
+import tempfile
+from contextlib import asynccontextmanager
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
+import torch
 from ultralytics import YOLO
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import logging
+
+# --- Configuration ---
+class Config:
+    MODEL_PATH = "yolov8n.pt"
+    ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
+    MAX_VIDEO_SIZE_MB = 500
+    MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
+    FRAME_SKIP = 1  # Process every Nth frame (1 = all frames, 2 = every other frame)
+    BATCH_SIZE = 32  # Batch size for YOLO inference
+    ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    LOG_LEVEL = "INFO"
+
+config = Config()
+
+# --- Logging Setup ---
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- Response Models ---
+class SearchResponse(BaseModel):
+    message: str
+    first_frame: int
+    last_frame: int
+    total_frames: int
+    fps: float
+    first_timestamp: float = Field(description="Time in seconds")
+    last_timestamp: float = Field(description="Time in seconds")
+    duration: float = Field(description="Detection duration in seconds")
+    confidence: Optional[float] = Field(None, description="Average detection confidence")
+
+# --- Application Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup and shutdown events"""
+    # Startup
+    logger.info("Starting VidSpot API...")
+    
+    if not Path(config.MODEL_PATH).exists():
+        logger.error(f"Model file not found at: {config.MODEL_PATH}")
+        raise FileNotFoundError(f"Model file not found at: {config.MODEL_PATH}")
+    
+    try:
+        app.state.model = YOLO(config.MODEL_PATH)
+        logger.info(f"YOLOv8 model loaded successfully from {config.MODEL_PATH}")
+        
+        # Create thread pool for async processing
+        app.state.executor = ThreadPoolExecutor(max_workers=2)
+        logger.info("Thread pool executor initialized")
+        
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {e}")
+        raise SystemExit(f"Model loading failed: {e}")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down VidSpot API...")
+    app.state.executor.shutdown(wait=True)
+    logger.info("Cleanup complete")
 
 # --- FastAPI App Setup ---
 app = FastAPI(
     title="VidSpot YOLOv8 Object Detection API",
-    description="API for detecting the first and last frame of a specific object in a video using YOLOv8."
+    description="API for detecting the first and last frame of a specific object in a video using YOLOv8.",
+    version="2.0.0",
+    lifespan=lifespan
 )
-
-# Define origins for CORS (React development server)
-origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=config.ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"], 
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- Model Loading ---
-MODEL_PATH = "yolov8n.pt"
-model: YOLO # Explicit type hint for Pylance
+# --- Utility Functions ---
 
-try:
-    if not Path(MODEL_PATH).exists():
-        raise FileNotFoundError(f"Model file not found at: {MODEL_PATH}")
-        
-    # Load the model once at startup
-    model = YOLO(MODEL_PATH)
-    print(f"YOLOv8 model loaded successfully from {MODEL_PATH}")
+def validate_video_file(file: UploadFile) -> None:
+    """Validate uploaded video file"""
+    # Check extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in config.ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed types: {', '.join(config.ALLOWED_VIDEO_EXTENSIONS)}"
+        )
     
-except Exception as e:
-    print(f"FATAL: Error loading YOLO model. Application will not function: {e}")
-    # Halt startup if the core model dependency fails
-    raise SystemExit(f"Model loading failed: {e}")
+    # Check MIME type
+    if not file.content_type or not file.content_type.startswith('video/'):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid content type. Must be a video file."
+        )
 
+def get_yolo_class_id(model: YOLO, target_class: str) -> Optional[int]:
+    """Find the COCO class ID for a given class name"""
+    for class_id, class_name in model.names.items():
+        if class_name.lower() == target_class.lower():
+            return class_id
+    return None
 
-# --- Utility Functions & Context Manager ---
+def get_available_classes(model: YOLO) -> list:
+    """Get list of all available YOLO classes"""
+    return sorted(model.names.values())
 
-@contextmanager
-def video_capture_context(video_path: str):
+def process_video_for_object(
+    video_path: str, 
+    target_class_id: int,
+    model: YOLO,
+    frame_skip: int = 1
+) -> Dict[str, Any]:
     """
-    Custom context manager for cv2.VideoCapture to ensure resources are released.
+    Scan video for a specific object class and return detection information.
+    
+    Args:
+        video_path: Path to video file
+        target_class_id: YOLO class ID to detect
+        model: Loaded YOLO model
+        frame_skip: Process every Nth frame (default: 1 = all frames)
+    
+    Returns:
+        Dictionary with detection results
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        cap.release()
-        raise IOError("Could not open video file.")
+        raise IOError("Could not open video file. File may be corrupted.")
+
     try:
-        yield cap
-    finally:
-        cap.release()
-
-def get_yolo_class_id(target_class: str, yolo_model: YOLO) -> Optional[int]:
-    """Tries to find the COCO class ID for a given class name."""
-    # Use the model's names dictionary to efficiently find the class ID
-    for class_id, class_name in yolo_model.names.items():
-        if class_name.lower() == target_class.lower():
-            return class_id
-            
-    return None
-
-def process_video_for_object(video_path: str, target_class_id: int, yolo_model: YOLO):
-    """
-    Scans a video for a specific object class and returns the first and last
-    frame numbers where it is detected, along with the video's FPS.
-    """
-    first_frame = -1
-    last_frame = -1
-    frame_count = 0
-    fps = 0.0
-
-    # Use the context manager for safe resource handling
-    with video_capture_context(video_path) as cap:
-        # Get video properties
         fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        first_frame = -1
+        last_frame = -1
+        frame_count = 0
+        confidences = []
+        
+        frames_batch = []
+        frame_indices = []
 
-        while True:
-            # Read the frame
-            ret, frame = cap.read() 
+        while cap.isOpened():
+            ret, frame = cap.read()
             if not ret:
                 break
             
-            # Run YOLO inference (only checking for the presence of the target class)
-            # The 'verbose=False' is already good for keeping the console clean.
-            results = yolo_model(frame, verbose=False, stream=False) 
+            # Skip frames if configured
+            if frame_count % frame_skip != 0:
+                frame_count += 1
+                continue
             
-            detected = False
-            # Ensure results are valid and boxes exist
-            if results and results[0].boxes is not None:
-                # Check if the target class ID is in the detected classes
-                # Check is efficient as it only needs to look at the class IDs
-                if target_class_id in results[0].boxes.cls.tolist():
-                    detected = True
-
-            if detected:
-                if first_frame == -1:
-                    first_frame = frame_count
-                last_frame = frame_count
+            frames_batch.append(frame)
+            frame_indices.append(frame_count)
+            
+            # Process in batches
+            if len(frames_batch) >= config.BATCH_SIZE:
+                results = model(frames_batch, verbose=False)
+                
+                for i, result in enumerate(results):
+                    if result.boxes:
+                        detected_classes = result.boxes.cls.tolist()
+                        if target_class_id in detected_classes:
+                            current_frame = frame_indices[i]
+                            if first_frame == -1:
+                                first_frame = current_frame
+                            last_frame = current_frame
+                            
+                            # Store confidence scores
+                            mask = result.boxes.cls == target_class_id
+                            conf_values = result.boxes.conf[mask].tolist()
+                            confidences.extend(conf_values)
+                
+                frames_batch = []
+                frame_indices = []
             
             frame_count += 1
+        
+        # Process remaining frames
+        if frames_batch:
+            results = model(frames_batch, verbose=False)
+            for i, result in enumerate(results):
+                if result.boxes:
+                    detected_classes = result.boxes.cls.tolist()
+                    if target_class_id in detected_classes:
+                        current_frame = frame_indices[i]
+                        if first_frame == -1:
+                            first_frame = current_frame
+                        last_frame = current_frame
+                        
+                        mask = result.boxes.cls == target_class_id
+                        conf_values = result.boxes.conf[mask].tolist()
+                        confidences.extend(conf_values)
+        
+        avg_confidence = sum(confidences) / len(confidences) if confidences else None
+        
+        return {
+            "first_frame": first_frame,
+            "last_frame": last_frame,
+            "total_frames": total_frames,
+            "fps": fps,
+            "confidence": avg_confidence
+        }
     
-    # Return FPS along with frames and total count
-    return first_frame, last_frame, frame_count, fps
+    finally:
+        cap.release()
 
 # --- API Endpoints ---
 
-@app.post("/search")
+@app.get("/")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "service": "VidSpot Backend API",
+        "version": "2.0.0",
+        "model_loaded": hasattr(app.state, 'model')
+    }
+
+@app.get("/classes")
+def list_classes():
+    """Get list of all available YOLO classes"""
+    if not hasattr(app.state, 'model'):
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    classes = get_available_classes(app.state.model)
+    return {
+        "classes": classes,
+        "count": len(classes)
+    }
+
+@app.post("/search", response_model=SearchResponse)
 async def search_video(
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     target_class: str = Form(...),
 ):
-    # Trim the target class early for robust validation
-    trimmed_class = target_class.strip()
+    """
+    Search for object in uploaded video
     
-    # 1. Validate Target Class
-    target_class_id = get_yolo_class_id(trimmed_class, model)
+    Args:
+        video: Video file to process
+        target_class: Object class to detect (e.g., 'person', 'car', 'dog')
+    
+    Returns:
+        Detection results with frame numbers and timestamps
+    """
+    
+    # Validate file
+    validate_video_file(video)
+    
+    # Validate target class
+    target_class_id = get_yolo_class_id(app.state.model, target_class)
     if target_class_id is None:
-        return JSONResponse(
-            status_code=200, 
-            content={
-                "message": f"Object '{trimmed_class}' is not a recognized YOLO class. Please try 'person', 'car', 'dog', etc.",
-                "first_frame": -1,
-                "last_frame": -1,
-                "fps": 0.0 
+        available_classes = get_available_classes(app.state.model)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Object '{target_class}' is not a recognized YOLO class.",
+                "available_classes": available_classes[:20],  # Show first 20
+                "suggestion": "Try 'person', 'car', 'dog', 'cat', 'bottle', etc."
             }
         )
-
-    # 2. Save Uploaded Video to a Temporary File
+    
+    # Create temporary directory
     temp_dir = tempfile.mkdtemp()
     temp_video_path = os.path.join(temp_dir, video.filename)
     
     try:
-        # Write the uploaded file content to the temp path
+        # Save uploaded file
+        file_size = 0
         with open(temp_video_path, "wb") as buffer:
-            shutil.copyfileobj(video.file, buffer)
-
-        # 3. Process the Video
-        first_frame, last_frame, total_frames, fps = process_video_for_object(
-            temp_video_path, target_class_id, model
+            while chunk := await video.read(8192):  # Read in chunks
+                file_size += len(chunk)
+                if file_size > config.MAX_VIDEO_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size: {config.MAX_VIDEO_SIZE_MB}MB"
+                    )
+                buffer.write(chunk)
+        
+        logger.info(f"Processing video: {video.filename} ({file_size / 1024 / 1024:.2f}MB)")
+        
+        # Process video in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            app.state.executor,
+            process_video_for_object,
+            temp_video_path,
+            target_class_id,
+            app.state.model,
+            config.FRAME_SKIP
         )
-
-        # 4. Return Results
+        
+        # Calculate timestamps
+        fps = result["fps"]
+        first_frame = result["first_frame"]
+        last_frame = result["last_frame"]
+        
         if first_frame == -1:
-             response_content = {
-                "message": f"Object '{trimmed_class}' was not found in the video over {total_frames} frames.",
-                "first_frame": -1,
-                "last_frame": -1,
-                "fps": fps
-            }
-        else:
-             response_content = {
-                "message": f"Object '{trimmed_class}' detected from frame {first_frame} to {last_frame} (Total frames: {total_frames}).",
-                "first_frame": first_frame,
-                "last_frame": last_frame,
-                "fps": fps
-            }
-            
-        return JSONResponse(content=response_content)
-
+            return SearchResponse(
+                message=f"Object '{target_class}' was not found in the video.",
+                first_frame=-1,
+                last_frame=-1,
+                total_frames=result["total_frames"],
+                fps=fps,
+                first_timestamp=0.0,
+                last_timestamp=0.0,
+                duration=0.0,
+                confidence=None
+            )
+        
+        first_timestamp = first_frame / fps if fps > 0 else 0
+        last_timestamp = last_frame / fps if fps > 0 else 0
+        duration = last_timestamp - first_timestamp
+        
+        logger.info(
+            f"Detection complete: {target_class} found in frames {first_frame}-{last_frame} "
+            f"({first_timestamp:.2f}s-{last_timestamp:.2f}s)"
+        )
+        
+        return SearchResponse(
+            message=f"Object '{target_class}' detected from frame {first_frame} to {last_frame}.",
+            first_frame=first_frame,
+            last_frame=last_frame,
+            total_frames=result["total_frames"],
+            fps=fps,
+            first_timestamp=first_timestamp,
+            last_timestamp=last_timestamp,
+            duration=duration,
+            confidence=result["confidence"]
+        )
+    
     except IOError as e:
-        # Catch video opening/reading errors
-        raise HTTPException(status_code=500, detail=f"Video processing I/O error: {e}")
+        logger.error(f"Video processing error: {e}")
+        raise HTTPException(status_code=422, detail=f"Video processing error: {str(e)}")
     except Exception as e:
-        # Catch unexpected errors
-        print(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during processing. Check server logs.")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
     finally:
-        # 5. Cleanup Temporary File/Directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # Schedule cleanup
+        background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
+        # Close file handle
+        await video.close()
 
-# Basic root endpoint for health check
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "VidSpot Backend API", "model_loaded": True}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
