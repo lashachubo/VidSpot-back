@@ -99,6 +99,13 @@ app.add_middleware(
 
 def validate_video_file(file: UploadFile) -> None:
     """Validate uploaded video file"""
+    # Check filename exists
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is required"
+        )
+    
     # Check extension
     file_ext = Path(file.filename).suffix.lower()
     if file_ext not in config.ALLOWED_VIDEO_EXTENSIONS:
@@ -264,6 +271,10 @@ async def search_video(
     Returns:
         Detection results with frame numbers and timestamps
     """
+    
+    # Validate filename exists
+    if not video.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
     
     # Validate file
     validate_video_file(video)
