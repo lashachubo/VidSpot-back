@@ -7,13 +7,15 @@ import tempfile
 from contextlib import asynccontextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import uuid
 
 import cv2
 import torch
 from ultralytics import YOLO
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import logging
 
@@ -368,9 +370,7 @@ async def search_video(
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
     finally:
-        # Schedule cleanup
         background_tasks.add_task(shutil.rmtree, temp_dir, ignore_errors=True)
-        # Close file handle
         await video.close()
 
 if __name__ == "__main__":
